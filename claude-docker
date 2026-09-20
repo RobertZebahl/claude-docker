@@ -1,0 +1,463 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+#
+# claude-docker - runs Claude Code in a Docker sandbox.
+# Inside the container ONLY the current directory (your project folder) is visible, as /workspace.
+#
+# Python: the container has its own virtual environment (managed by uv), stored in a Docker volume
+# OUTSIDE the project folder. Your host .venv/venv is neither used nor modified; the project only
+# contains source code and the shared dependency files.
+#
+# Usage (from the project root, e.g. in the PyCharm terminal):
+#   claude-docker                                   # start Claude Code
+#   claude-docker --dangerously-skip-permissions    # any further arguments are passed to "claude"
+#   claude-docker --rebuild                         # rebuild the image (latest Claude Code + skills)
+#   claude-docker --shell                           # bash instead of Claude (Python env is active)
+#   claude-docker --reset-env                       # delete THIS project's Python env (recreated on next start)
+#
+# Optional environment variables:
+#   CLAUDE_PYTHON          force a Python version, e.g. 3.12
+#   CLAUDE_SKIP_ENV_SYNC=1 skip setting up the Python environment on start (no Python is available then)
+#   SKILLS_REF             branch/tag/commit of the skills repo (default: HEAD)
+#   CLAUDE_DEBUG=1         trace the container start-up (set -x) to see why a start fails
+#   CLAUDE_EXPOSE_DOTENV=1 do not hide the project's .env and .env.* files inside the sandbox (hidden by default)
+#   CLAUDE_UV_VERSION      uv version to install in the image, e.g. 0.8.4 (default: the uv version found on the host)
+
+# This script calls `exit` and `exec`, so sourcing it would close your terminal session.
+# Must run BEFORE `set -e` so that no shell options leak into an interactive shell.
+if [ "${BASH_SOURCE[0]:-$0}" != "$0" ]; then
+  echo "claude-docker must be executed, not sourced. Run it as: claude-docker" >&2
+  return 1
+fi
+
+set -euo pipefail
+
+IMAGE_VERSION=1
+IMAGE="claude-code-sandbox:v${IMAGE_VERSION}"
+CONFIG_VOLUME="claude-code-sandbox-config"   # login + settings (NOT your real ~/.claude)
+SKILLS_REPO="https://github.com/mattpocock/skills.git"
+SKILLS_REF="${SKILLS_REF:-HEAD}"
+# grill-me and grill-with-docs are required; grilling and domain-modeling are presumed helper skills
+# (if they are missing from the repo, the build only prints a warning).
+SKILLS="grill-me grill-with-docs grilling domain-modeling"
+# .env files that are NOT hidden in the sandbox: templates without secrets (.env.example etc.)
+DOTENV_TEMPLATES="example sample template dist"
+
+REBUILD=0
+SHELL_ONLY=0
+RESET_ENV=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --rebuild)   REBUILD=1; shift ;;
+    --shell)     SHELL_ONLY=1; shift ;;
+    --reset-env) RESET_ENV=1; shift ;;
+    --)          shift; break ;;
+    *)           break ;;
+  esac
+done
+
+# ---------- Preflight checks ----------
+if ! command -v docker >/dev/null 2>&1; then
+  echo "Error: Docker is not installed." >&2
+  exit 1
+fi
+if ! docker info >/dev/null 2>&1; then
+  echo "Error: cannot reach the Docker daemon (is it running? is your user in the 'docker' group?)." >&2
+  exit 1
+fi
+
+PROJECT_DIR="$(pwd -P)"
+HOME_DIR="$(cd ~ && pwd -P)"
+if [ "$PROJECT_DIR" = "/" ] || [ "$PROJECT_DIR" = "$HOME_DIR" ]; then
+  echo "Aborting: '$PROJECT_DIR' is not a project folder. Please start from the project root," >&2
+  echo "otherwise the sandbox would see your entire home directory." >&2
+  exit 1
+fi
+
+# One Python-env volume per project (name = folder name + path hash)
+proj_name="$(printf '%s' "$(basename "$PROJECT_DIR")" | tr -c 'A-Za-z0-9_.-' '_')"
+proj_hash="$(printf '%s' "$PROJECT_DIR" | sha1sum | cut -c1-8)"
+ENV_VOLUME="claude-pyenv-${proj_name}-${proj_hash}"
+
+if [ "$RESET_ENV" = 1 ]; then
+  docker volume rm "$ENV_VOLUME" && echo "Python environment '$ENV_VOLUME' deleted."
+  exit 0
+fi
+
+# Pick the Python version: CLAUDE_PYTHON > .python-version > host venv's pyvenv.cfg > host python3
+detect_python_version() {
+  local v="" cfg
+  if [ -n "${CLAUDE_PYTHON:-}" ]; then
+    echo "$CLAUDE_PYTHON"
+    return 0
+  fi
+  if [ -f "$PROJECT_DIR/.python-version" ]; then
+    v="$(head -n 1 "$PROJECT_DIR/.python-version" | tr -d '[:space:]')"
+  fi
+  if [ -z "$v" ]; then
+    for cfg in "$PROJECT_DIR/.venv/pyvenv.cfg" "$PROJECT_DIR/venv/pyvenv.cfg"; do
+      if [ -f "$cfg" ]; then
+        v="$(sed -nE 's/^version(_info)?[[:space:]]*=[[:space:]]*([0-9]+\.[0-9]+).*/\2/p' "$cfg" | head -n 1)"
+        if [ -n "$v" ]; then break; fi
+      fi
+    done
+  fi
+  if [ -z "$v" ] && command -v python3 >/dev/null 2>&1; then
+    v="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)"
+  fi
+  echo "$v"
+}
+
+# uv version for the image: CLAUDE_UV_VERSION > uv found on the host > latest (fallback)
+UV_VERSION_WANTED="latest"
+UV_VERSION_SOURCE="fallback: no usable host uv found"
+UV_VERSION_IS_FALLBACK=1
+detect_uv_version() {
+  local v=""
+  if [ -n "${CLAUDE_UV_VERSION:-}" ]; then
+    v="$CLAUDE_UV_VERSION"
+    if [ "$v" = "latest" ] || [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      UV_VERSION_WANTED="$v"
+      UV_VERSION_SOURCE="CLAUDE_UV_VERSION"
+      UV_VERSION_IS_FALLBACK=0
+      return 0
+    fi
+    echo "Warning: CLAUDE_UV_VERSION='$v' is not a version like 0.8.4 (or 'latest'); ignoring it." >&2
+  fi
+  if command -v uv >/dev/null 2>&1; then
+    v="$(uv --version 2>/dev/null | awk '{print $2}' || true)"
+    if [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      UV_VERSION_WANTED="$v"
+      UV_VERSION_SOURCE="host uv"
+      UV_VERSION_IS_FALLBACK=0
+    fi
+  fi
+}
+detect_uv_version
+
+# ---------- Build the image ----------
+CTX=""
+cleanup() { if [ -n "$CTX" ]; then rm -rf "$CTX"; fi; return 0; }
+trap cleanup EXIT
+
+build_image() {
+  CTX="$(mktemp -d)"
+
+  # --- Notes for Claude (ends up as ~/.claude/CLAUDE.md inside the sandbox) ---
+  cat >"$CTX/sandbox-CLAUDE.md" <<'EOF'
+# Sandbox environment
+
+You are running inside a Docker sandbox. Only the project folder is mounted, as /workspace.
+
+- A Python environment is already active (/home/claude/pyenv/venv). It lives OUTSIDE the project on purpose.
+- Never create a .venv/venv inside the project and never touch an existing one: it belongs to the host
+  and does not work in here.
+- Use `python`, `pytest`, `pip install ...` or `uv pip install ...` directly.
+- The code must also run outside this container. ALWAYS add new dependencies to the project's dependency
+  file (requirements.txt or pyproject.toml) as well. Anything installed only via `pip install` exists
+  only in this sandbox.
+- Do not write container paths (e.g. /workspace) into project files.
+- There are no Git credentials and no SSH keys in here: do not try to push.
+EOF
+
+  # --- Entrypoint ---
+  cat >"$CTX/entrypoint.sh" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+if [ "${CLAUDE_DEBUG:-0}" = 1 ]; then
+  set -x
+fi
+
+PYROOT="$(dirname "$VIRTUAL_ENV")"
+
+# Provide skills and sandbox notes from the image on every start.
+# Each skill directory is REPLACED (never merged into the old copy): overwriting existing read-only
+# files would fail on the second start. A failure here must never keep Claude from starting.
+provision_claude_config() {
+  local d name
+  mkdir -p "$CLAUDE_CONFIG_DIR/skills"
+  for d in /opt/claude-skills/*/; do
+    name="$(basename "$d")"
+    if [ -e "$CLAUDE_CONFIG_DIR/skills/$name" ]; then
+      chmod -R u+w "$CLAUDE_CONFIG_DIR/skills/$name" 2>/dev/null || true
+      rm -rf "${CLAUDE_CONFIG_DIR:?}/skills/$name"
+    fi
+    cp -RL "$d" "$CLAUDE_CONFIG_DIR/skills/$name"
+    chmod -R u+rwX "$CLAUDE_CONFIG_DIR/skills/$name"
+  done
+  rm -f "$CLAUDE_CONFIG_DIR/CLAUDE.md"
+  cp /opt/sandbox-CLAUDE.md "$CLAUDE_CONFIG_DIR/CLAUDE.md"
+}
+provision_claude_config || echo "WARNING: could not set up skills/notes in $CLAUDE_CONFIG_DIR (see output above)." >&2
+
+setup_python_env() {
+  if [ "${CLAUDE_SKIP_ENV_SYNC:-0}" = 1 ]; then
+    return 0
+  fi
+  cd /workspace
+
+  local want="${CLAUDE_PYTHON:-}"
+  local py_args=()
+  if [ -n "$want" ]; then
+    py_args=(--python "$want")
+  fi
+
+  # 1) Create the environment if it is missing or the requested Python version changed
+  local stamp=""
+  if [ -f "$PYROOT/python-spec" ]; then
+    stamp="$(cat "$PYROOT/python-spec")"
+  fi
+  if [ ! -x "$VIRTUAL_ENV/bin/python" ] || [ "$stamp" != "$want" ]; then
+    echo ">> Creating Python environment (${want:-default version}) ..."
+    rm -rf "$VIRTUAL_ENV"
+    if uv venv --seed "${py_args[@]}" "$VIRTUAL_ENV"; then
+      printf '%s' "$want" > "$PYROOT/python-spec"
+      rm -f "$PYROOT/deps-hash"
+    else
+      echo "WARNING: could not create the Python environment." >&2
+      return 0
+    fi
+  fi
+
+  # 2) Install dependencies, but only when the dependency files changed
+  local files=() f
+  for f in uv.lock pyproject.toml setup.py setup.cfg requirements*.txt requirements/*.txt; do
+    if [ -f "$f" ]; then files+=("$f"); fi
+  done
+  if [ "${#files[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  local hash old=""
+  hash="$(cat "${files[@]}" | sha256sum | cut -d' ' -f1)"
+  if [ -f "$PYROOT/deps-hash" ]; then
+    old="$(cat "$PYROOT/deps-hash")"
+  fi
+  if [ "$hash" = "$old" ]; then
+    return 0
+  fi
+
+  echo ">> Installing project dependencies ..."
+  local ok=1 r
+  if [ -f uv.lock ] && [ -f pyproject.toml ]; then
+    uv sync --frozen || ok=0          # --frozen: never modifies uv.lock in the project
+  else
+    for r in requirements*.txt requirements/*.txt; do
+      if [ -f "$r" ]; then
+        uv pip install -r "$r" || ok=0
+      fi
+    done
+    if [ -f setup.py ] || [ -f setup.cfg ] || \
+       { [ -f pyproject.toml ] && grep -qE '^\[(project|tool\.poetry)\]' pyproject.toml; }; then
+      uv pip install -e . || ok=0
+    fi
+  fi
+
+  if [ "$ok" = 1 ]; then
+    printf '%s' "$hash" > "$PYROOT/deps-hash"
+  else
+    echo "WARNING: not all dependencies could be installed (see output above)." >&2
+  fi
+  return 0
+}
+
+setup_python_env || echo "WARNING: setting up the Python environment failed." >&2
+
+cd /workspace
+if [ "${SANDBOX_SHELL:-0}" = 1 ]; then
+  exec bash
+fi
+exec claude "$@"
+EOF
+
+  # --- Dockerfile ---
+  cat >"$CTX/Dockerfile" <<'EOF'
+ARG UV_VERSION=latest
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uvbin
+
+FROM node:22-bookworm-slim
+
+ARG UV_VERSION
+LABEL sandbox.uv-version="${UV_VERSION}"
+
+ARG USER_UID=1000
+ARG USER_GID=1000
+ARG SKILLS_REPO
+ARG SKILLS_REF=HEAD
+ARG SKILLS
+
+# build-essential: compiler toolchain for Python packages that have no prebuilt wheel
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential git ca-certificates curl ripgrep jq less procps \
+ && rm -rf /var/lib/apt/lists/*
+
+# uv manages Python versions and virtual environments; its version matches the one on the host
+COPY --from=uvbin /uv /uvx /usr/local/bin/
+
+RUN npm install -g @anthropic-ai/claude-code
+
+# Fetch skills from the repo (directory layout does not matter: we look for <name>/SKILL.md)
+RUN git clone "$SKILLS_REPO" /tmp/skills-src \
+ && git -C /tmp/skills-src checkout "$SKILLS_REF" \
+ && mkdir -p /opt/claude-skills \
+ && for s in $SKILLS; do \
+      f="$(find /tmp/skills-src -type f -path "*/$s/SKILL.md" | head -n 1)"; \
+      if [ -n "$f" ]; then \
+        cp -RL "$(dirname "$f")" "/opt/claude-skills/$s" && chmod -R u+rwX,go+rX "/opt/claude-skills/$s" && echo "Skill installed: $s"; \
+      else \
+        echo "WARNING: skill '$s' not found in repo" >&2; \
+      fi; \
+    done \
+ && test -f /opt/claude-skills/grill-me/SKILL.md \
+ && test -f /opt/claude-skills/grill-with-docs/SKILL.md \
+ && rm -rf /tmp/skills-src
+
+# User with the host user's UID/GID so files in the project folder belong to you
+RUN (userdel -r node 2>/dev/null || true) \
+ && groupadd -o -g "$USER_GID" claude \
+ && useradd -o -m -u "$USER_UID" -g "$USER_GID" -s /bin/bash claude \
+ && mkdir -p /workspace /home/claude/.claude-config /home/claude/pyenv \
+ && chown -R claude:claude /workspace /home/claude
+
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY sandbox-CLAUDE.md /opt/sandbox-CLAUDE.md
+RUN chmod 755 /usr/local/bin/entrypoint.sh
+
+# Python env, uv cache and Python installs live in the volume /home/claude/pyenv (not in the project)
+ENV CLAUDE_CONFIG_DIR=/home/claude/.claude-config \
+    DISABLE_AUTOUPDATER=1 \
+    VIRTUAL_ENV=/home/claude/pyenv/venv \
+    UV_PROJECT_ENVIRONMENT=/home/claude/pyenv/venv \
+    UV_PYTHON_INSTALL_DIR=/home/claude/pyenv/python \
+    UV_CACHE_DIR=/home/claude/pyenv/cache \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/home/claude/pyenv/venv/bin:${PATH}"
+
+USER claude
+WORKDIR /workspace
+RUN git config --global --add safe.directory /workspace
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+EOF
+
+  local build_opts=()
+  if [ "$REBUILD" = 1 ]; then
+    build_opts+=(--pull --no-cache)
+  fi
+
+  echo ">> Building image with uv $UV_VERSION_WANTED ($UV_VERSION_SOURCE) ..."
+  if ! docker build "${build_opts[@]}" -t "$IMAGE" \
+    --build-arg "UV_VERSION=$UV_VERSION_WANTED" \
+    --build-arg "USER_UID=$(id -u)" \
+    --build-arg "USER_GID=$(id -g)" \
+    --build-arg "SKILLS_REPO=$SKILLS_REPO" \
+    --build-arg "SKILLS_REF=$SKILLS_REF" \
+    --build-arg "SKILLS=$SKILLS" \
+    "$CTX"; then
+    echo "Error: the image build failed. If the uv image tag '$UV_VERSION_WANTED' does not exist," >&2
+    echo "set CLAUDE_UV_VERSION to an existing uv version (or to 'latest')." >&2
+    exit 1
+  fi
+}
+
+# Rebuild when requested, when the image is missing, or when the host's uv version differs from the image's
+need_build=0
+if [ "$REBUILD" = 1 ]; then
+  need_build=1
+elif ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  need_build=1
+elif [ "$UV_VERSION_IS_FALLBACK" = 0 ]; then
+  image_uv="$(docker image inspect --format '{{ index .Config.Labels "sandbox.uv-version" }}' "$IMAGE" 2>/dev/null || true)"
+  if [ "$image_uv" != "$UV_VERSION_WANTED" ]; then
+    echo ">> uv version changed (image: ${image_uv:-unknown}, wanted: $UV_VERSION_WANTED) - rebuilding the image ..."
+    need_build=1
+  fi
+fi
+if [ "$need_build" = 1 ]; then
+  build_image
+fi
+
+# ---------- Start the container ----------
+RUN_ARGS=(
+  --rm -it
+  --cap-drop=ALL                                   # no Linux capabilities
+  --security-opt no-new-privileges                 # no privilege escalation
+  --pids-limit 1024
+  -v "$PROJECT_DIR:/workspace"                     # the only host access: the project folder
+  -v "$CONFIG_VOLUME:/home/claude/.claude-config"  # Claude login/settings
+  -v "$ENV_VOLUME:/home/claude/pyenv"              # Python environment (per project)
+  -w /workspace
+  -e TERM -e COLORTERM
+)
+
+# Hide the host venv inside the container: Claude can neither see nor damage it
+for d in .venv venv; do
+  if [ -f "$PROJECT_DIR/$d/pyvenv.cfg" ]; then
+    RUN_ARGS+=(--tmpfs "/workspace/$d:rw,mode=1777,size=64m")
+  fi
+done
+
+# Hide .env and .env.* files (secrets) in the project root inside the container: they show up empty and
+# read-only. Templates such as .env.example (see DOTENV_TEMPLATES) stay visible. Only files that exist are
+# hidden (otherwise Docker would create them in your project). Set CLAUDE_EXPOSE_DOTENV=1 to keep everything
+# visible, e.g. if tests inside the sandbox need the values.
+hide_dotenv_files() {
+  local f name t skip
+  shopt -s nullglob
+  for f in "$PROJECT_DIR"/.env "$PROJECT_DIR"/.env.*; do
+    name="${f##*/}"
+    skip=0
+    for t in $DOTENV_TEMPLATES; do
+      if [ "$name" = ".env.$t" ]; then skip=1; fi
+    done
+    if [ "$skip" = 1 ]; then
+      continue
+    fi
+    if [ -L "$f" ]; then
+      echo "Warning: $name is a symlink and is NOT hidden in the sandbox." >&2
+    elif [ -f "$f" ]; then
+      case "$name" in
+        *:*) echo "Warning: $name contains ':' and is NOT hidden in the sandbox." >&2 ;;
+        *)   RUN_ARGS+=(-v "/dev/null:/workspace/$name:ro") ;;
+      esac
+    fi
+  done
+  shopt -u nullglob
+}
+if [ "${CLAUDE_EXPOSE_DOTENV:-0}" != 1 ]; then
+  hide_dotenv_files
+fi
+
+py_version="$(detect_python_version)"
+if [ -n "$py_version" ]; then
+  RUN_ARGS+=(-e "CLAUDE_PYTHON=$py_version")
+fi
+if [ -n "${CLAUDE_SKIP_ENV_SYNC:-}" ]; then
+  RUN_ARGS+=(-e "CLAUDE_SKIP_ENV_SYNC=$CLAUDE_SKIP_ENV_SYNC")
+fi
+if [ -n "${CLAUDE_DEBUG:-}" ]; then
+  RUN_ARGS+=(-e "CLAUDE_DEBUG=$CLAUDE_DEBUG")
+fi
+
+# Pass the API key only if it is set on the host (not needed with a subscription login)
+if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+  RUN_ARGS+=(-e ANTHROPIC_API_KEY)
+fi
+
+# Git identity (name/email only) so commits work inside the container
+git_name="$(git config --global user.name 2>/dev/null || true)"
+git_mail="$(git config --global user.email 2>/dev/null || true)"
+if [ -n "$git_name" ]; then
+  RUN_ARGS+=(-e "GIT_AUTHOR_NAME=$git_name" -e "GIT_COMMITTER_NAME=$git_name")
+fi
+if [ -n "$git_mail" ]; then
+  RUN_ARGS+=(-e "GIT_AUTHOR_EMAIL=$git_mail" -e "GIT_COMMITTER_EMAIL=$git_mail")
+fi
+
+if [ "$SHELL_ONLY" = 1 ]; then
+  RUN_ARGS+=(-e SANDBOX_SHELL=1)
+fi
+
+exec docker run "${RUN_ARGS[@]}" "$IMAGE" "$@"
